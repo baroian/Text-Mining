@@ -1,0 +1,768 @@
+from accelerate import Accelerator
+from datasets import Dataset, DatasetDict
+import csv
+import evaluate
+#from huggingface_hub import Repository, get_full_repo_name, create_repo
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.metrics import classification_report
+import torch
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from transformers import AutoModelForTokenClassification
+from transformers import AutoTokenizer
+from transformers import DataCollatorForTokenClassification
+from transformers import get_scheduler
+from transformers import TrainingArguments
+from transformers import Trainer
+from tqdm.auto import tqdm
+
+
+
+
+
+
+import tensorflow as tf
+
+gpus = tf.config.list_physical_devices('GPU')
+print("Num GPUs Available:", len(gpus))
+
+if gpus:
+    try:
+        # Enable memory growth for each GPU to prevent TensorFlow from allocating all GPU memory at once
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logical_gpus = tf.config.list_logical_devices('GPU')
+        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+    except RuntimeError as e:
+        print("Error setting memory growth:", e)
+else:
+    print("No GPU detected. Using CPU.")
+
+
+## Helper functions and declarations
+
+label_names = ['O', 'B-ART','I-ART','B-CON','I-CON','B-LOC','I-LOC',
+        'B-MAT','I-MAT','B-PER','I-PER','B-SPE','I-SPE']
+id2label = {i: l for i, l in enumerate(label_names)}
+label2id = {l: i for i, l in id2label.items()}
+
+model_name = "bert-finetuned-archeology"
+base_model_checkpoint = "bert-base-cased"
+
+
+
+def align_labels_with_tokens(labels, word_ids):
+    new_labels = []
+    current_word = None
+    for word_id in word_ids:
+        if word_id != current_word:
+            # Start of a new word!
+            current_word = word_id
+            label = -100 if word_id is None else labels[word_id]
+            new_labels.append(label)
+        elif word_id is None:
+            # Special token
+            new_labels.append(-100)
+        else:
+            # Same word as previous token
+            label = labels[word_id]
+            # If the label is B-XXX we change it to I-XXX
+            if label % 2 == 1:
+                label += 1
+            new_labels.append(label)
+
+    return new_labels
+
+
+def tokenize_and_align_labels(examples):
+    tokenized_inputs = tokenizer(
+        examples['tokens'], truncation=True, is_split_into_words=True
+    )
+    all_labels = examples['ner_tags']
+    new_labels = []
+    for i, labels in enumerate(all_labels):
+        word_ids = tokenized_inputs.word_ids(i)
+        new_labels.append(align_labels_with_tokens(labels, word_ids))
+    
+    tokenized_inputs['labels'] = new_labels
+    return tokenized_inputs
+
+
+def compute_metrics(eval_preds):
+    logits, labels = eval_preds
+    predictions = np.argmax(logits, axis=-1)
+
+    # Remove ignored index (special tokens) and convert to labels
+    true_labels = [[label_names[l] for l in label if l != -100] for label in labels]
+    true_predictions = [
+        [label_names[p] for (p, l) in zip(prediction, label) if l != -100]
+        for prediction, label in zip(predictions, labels)
+    ]
+    all_metrics = metric.compute(predictions=true_predictions, references=true_labels)
+    return {
+        "precision": all_metrics["overall_precision"],
+        "recall": all_metrics["overall_recall"],
+        "f1": all_metrics["overall_f1"],
+        "accuracy": all_metrics["overall_accuracy"],
+    }
+
+
+def parse(sentence):
+    tokens, ner_tags = [], []
+    for phrase in sentence:
+            features = phrase.split(' ')
+            tokens.append(features[0].strip())
+            ner_tags.append(label2id[features[2].strip()])
+    return {'tokens': tokens, 'ner_tags': ner_tags}
+
+
+def postprocess(predictions, labels):
+    predictions = predictions.detach().cpu().clone().numpy()
+    labels = labels.detach().cpu().clone().numpy()
+
+    # Remove ignored index (special tokens) and convert to labels
+    true_labels = [[label_names[l] for l in label if l != -100] for label in labels]
+    true_predictions = [
+        [label_names[p] for (p, l) in zip(prediction, label) if l != -100]
+        for prediction, label in zip(predictions, labels)
+    ]
+    return true_labels, true_predictions
+
+
+## Data Loading
+
+raw_datasets = {}
+for split in ('train', 'val', 'test'):
+    raw_datasets[split] = {}
+    with open(f'{split}.txt', 'r') as infile:
+        raw_data = infile.read()
+        lines = raw_data.split('\n')
+        sentences = raw_data.split('\n\n')
+        sentences = [parse(sentence.split('\n')) for sentence in sentences]
+        for sentence in sentences:
+            for k in sentence:
+                if k not in raw_datasets[split].keys():
+                    raw_datasets[split][k] = []
+                raw_datasets[split][k].append(sentence[k])
+
+
+datasets = {}
+for split in raw_datasets.keys():
+    datasets[split] = Dataset.from_dict(raw_datasets[split])
+data = DatasetDict(datasets)
+
+
+### Data statistics
+#### NER label distribution
+
+
+ner = data['train']['ner_tags']
+ner += data['test']['ner_tags']
+ner += data['val']['ner_tags']
+ner = np.array([tag for taglist in ner for tag in taglist])
+
+
+
+
+tokenizer = AutoTokenizer.from_pretrained(base_model_checkpoint)
+
+data_tokenized = data.map(
+    tokenize_and_align_labels,
+    batched=True,
+    remove_columns=data['train'].column_names)
+
+
+
+data_collator = DataCollatorForTokenClassification(tokenizer)
+metric = evaluate.load('seqeval')
+
+model = AutoModelForTokenClassification.from_pretrained(
+    base_model_checkpoint,
+    id2label=id2label,
+    label2id=label2id,
+)
+
+args = TrainingArguments(
+    model_name,
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    learning_rate=2e-5,
+    num_train_epochs=3,
+    weight_decay=0.01,
+    #push_to_hub=True,
+)
+
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=data_tokenized["train"],
+    eval_dataset=data_tokenized["val"],
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+    processing_class=tokenizer,
+)
+
+
+trainer.train()
+#trainer.push_to_hub(commit_message="Training complete") 
+
+
+
+# Evaluate on the test set
+test_results = trainer.predict(data_tokenized["test"])
+test_predictions, test_labels, _ = test_results
+
+test_predictions = np.argmax(test_predictions, axis=2)
+
+true_test_predictions = [
+    [id2label[pred] for (pred, lab) in zip(prediction, label) if lab != -100]
+    for prediction, label in zip(test_predictions, test_labels)
+]
+true_test_labels = [
+    [id2label[lab] for (pred, lab) in zip(prediction, label) if lab != -100]
+    for label, prediction in zip(test_labels, test_predictions)
+]
+
+results = metric.compute(predictions=true_test_predictions, references=true_test_labels)
+
+precision = results["overall_precision"]
+recall = results["overall_recall"]
+f1 = results["overall_f1"]
+
+print(f"Precision on Test Set: {precision:.4f}")
+print(f"Recall on Test Set: {recall:.4f}")
+print(f"F1 Score on Test Set: {f1:.4f}")
+
+
+
+
+model_checkpoint = 'bert-base-cased'
+num_train_epochs = 3
+
+params_list = [{'lr': lr, 'wd': wd, 'batch_size': batch_size, 'warm_up': warm_up}
+               for lr in (2e-5, 1e-4, 1e-2)
+               for wd in (0.0, 0.1, 0.01)
+               for batch_size in (16, 8)
+               for warm_up in (0, 100, 500)]
+
+data_collator = DataCollatorForTokenClassification(tokenizer)
+best_model_dir = 'bert-finetuned-archeology-optimized'
+
+
+
+
+import gc
+
+
+total_configs = len(params_list)
+print(f"Total Hyperparameter Configurations to Test: {total_configs}\n")
+
+all_results = {}
+best_f1 = 0.0
+best_model = None
+
+"""
+# Uncomment if run out of memory and don't want to restart the kernel
+
+del model, optimizer, train_dataloader, eval_dataloader
+torch.cuda.empty_cache()
+gc.collect()
+"""
+
+for i, params in enumerate(params_list):
+    run_id = '[lr={}; wd={}; batch_size={}; warm_up={}]'.format(
+        params['lr'], params['wd'], params['batch_size'], params['warm_up']
+    )
+    all_results[run_id] = {}
+    print(f"Running configuration {i + 1} / {total_configs}: {run_id}")
+    num_training_steps = num_train_epochs * len(data_tokenized['train']) // params['batch_size']
+    progress_bar = tqdm(range(num_training_steps))
+    metric = evaluate.load('seqeval')
+    model = AutoModelForTokenClassification.from_pretrained(
+        model_checkpoint, id2label=id2label, label2id=label2id
+    )
+    optimizer = AdamW(model.parameters(), 
+                      lr=params['lr'],
+                      weight_decay=params['wd'])
+
+    train_dataloader = DataLoader(
+        data_tokenized['train'],
+        shuffle=True,
+        collate_fn=data_collator,
+        batch_size=params['batch_size'],
+    )
+
+    eval_dataloader = DataLoader(
+        data_tokenized['val'],
+        collate_fn=data_collator,
+        batch_size=params['batch_size'],
+    )
+
+    accelerator = Accelerator() # smaller precision to avoid memory issues
+    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader
+    )
+
+    num_update_steps_per_epoch = len(train_dataloader)
+    num_training_steps = num_train_epochs * num_update_steps_per_epoch
+
+    lr_scheduler = get_scheduler(
+        'linear',
+        optimizer=optimizer,
+        num_warmup_steps=params['warm_up'],
+        num_training_steps=num_training_steps
+    )
+    for epoch in range(num_train_epochs):
+        model.train()
+        for batch in train_dataloader:
+            gc.collect() 
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            progress_bar.update(1)
+
+        model.eval()
+        for batch in eval_dataloader:
+            with torch.no_grad():
+                outputs = model(**batch)
+            
+            predictions = outputs.logits.argmax(dim=-1)
+            labels = batch['labels']
+            predictions_padded = accelerator.pad_across_processes(predictions, 
+                                                                dim=1, 
+                                                                pad_index=-100)
+            labels_padded = accelerator.pad_across_processes(labels, 
+                                                            dim=1, 
+                                                            pad_index=-100)
+            predictions_gathered = accelerator.gather(predictions_padded)
+            labels_gathered = accelerator.gather(labels_padded)
+
+            true_predictions, true_labels = postprocess(predictions_gathered,
+                                                        labels_gathered)
+
+            metric.add_batch(predictions=true_predictions, references=true_labels)
+            
+        all_results[run_id][epoch] = metric.compute()
+        print(
+            f"epoch {epoch}:",
+            {
+                key: all_results[run_id][epoch][f"overall_{key}"]
+                for key in ["precision", "recall", "f1", "accuracy"]
+            },
+        )
+        accelerator.wait_for_everyone()
+        if all_results[run_id][epoch]['overall_f1'] > best_f1:
+            best_f1 = all_results[run_id][epoch]['overall_f1']
+            unwrapped_model = accelerator.unwrap_model(model)
+            best_model = unwrapped_model
+    
+    # Clean up memory so it does not build up
+    del model, optimizer, train_dataloader, eval_dataloader
+    torch.cuda.empty_cache()
+    gc.collect()
+            
+
+best_model.save_pretrained(best_model_dir, save_function=accelerator.save)
+if accelerator.is_main_process:
+    tokenizer.save_pretrained(best_model_dir)
+    #repo.push_to_hub(commit_message=f"Best optimized model", blocking=False)
+
+
+
+
+
+
+
+import pandas as pd
+import re
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+
+results_list = []
+
+# Creates list of the with desired hyperparameters and F1 score
+for run_id in all_results:
+    hyperparams = re.findall(r'(\w+)=([^\];]+)', run_id)
+    hyperparam_dict = {k: v for k, v in hyperparams}
+    
+    best_epoch = None
+    best_f1 = -1.0  
+    
+    for epoch in all_results[run_id]:
+        epoch_metrics = all_results[run_id][epoch]
+        if 'overall_f1' in epoch_metrics:
+            f1_score = epoch_metrics['overall_f1']
+            if f1_score > best_f1:
+                best_f1 = f1_score
+                best_epoch = epoch
+    
+    if best_f1 >= 0:
+        result_entry = {
+            'run_id': run_id,
+            'lr': float(hyperparam_dict.get('lr', '0')),
+            'wd': float(hyperparam_dict.get('wd', '0')),
+            'batch_size': int(hyperparam_dict.get('batch_size', '0')),
+            'warm_up': int(hyperparam_dict.get('warm_up', '0')),  # Added warm_up
+            'best_epoch': best_epoch,
+            'best_f1': best_f1,
+        }
+        results_list.append(result_entry)
+
+results_df = pd.DataFrame(results_list)
+
+results_df['best_f1'] = results_df['best_f1'].round(4)
+
+top_3 = results_df.sort_values(by='best_f1', ascending=False).head(3)
+print("Top 3 Configurations:")
+print(top_3[['lr', 'wd', 'batch_size', 'warm_up', 'best_f1']])
+
+
+# Combine average mean performance for each hyperparameter into one table
+
+lr_mean_performance = results_df.groupby('lr')['best_f1'].mean().reset_index()
+lr_mean_performance['Hyperparameter'] = 'Learning Rate'
+lr_mean_performance.rename(columns={'lr': 'Value', 'best_f1': 'Mean Best F1'}, inplace=True)
+
+wd_mean_performance = results_df.groupby('wd')['best_f1'].mean().reset_index()
+wd_mean_performance['Hyperparameter'] = 'Weight Decay'
+wd_mean_performance.rename(columns={'wd': 'Value', 'best_f1': 'Mean Best F1'}, inplace=True)
+
+batch_size_mean_performance = results_df.groupby('batch_size')['best_f1'].mean().reset_index()
+batch_size_mean_performance['Hyperparameter'] = 'Batch Size'
+batch_size_mean_performance.rename(columns={'batch_size': 'Value', 'best_f1': 'Mean Best F1'}, inplace=True)
+
+warm_up_mean_performance = results_df.groupby('warm_up')['best_f1'].mean().reset_index()
+warm_up_mean_performance['Hyperparameter'] = 'Warm Up Steps'
+warm_up_mean_performance.rename(columns={'warm_up': 'Value', 'best_f1': 'Mean Best F1'}, inplace=True)
+
+# Round to 4 decimal places
+lr_mean_performance['Mean Best F1'] = lr_mean_performance['Mean Best F1'].round(4)
+wd_mean_performance['Mean Best F1'] = wd_mean_performance['Mean Best F1'].round(4)
+batch_size_mean_performance['Mean Best F1'] = batch_size_mean_performance['Mean Best F1'].round(4)
+warm_up_mean_performance['Mean Best F1'] = warm_up_mean_performance['Mean Best F1'].round(4)
+
+# Convert to int
+batch_size_mean_performance['Value'] = batch_size_mean_performance['Value'].astype(int)
+warm_up_mean_performance['Value'] = warm_up_mean_performance['Value'].astype(int)
+
+# Combine all into one DataFrame
+mean_performance_df = pd.concat(
+    [lr_mean_performance, wd_mean_performance, batch_size_mean_performance, warm_up_mean_performance],
+    ignore_index=True
+)
+
+# Reorder columns
+mean_performance_df = mean_performance_df[['Hyperparameter', 'Value', 'Mean Best F1']]
+
+mean_performance_df = mean_performance_df.sort_values(by=['Hyperparameter', 'Value'])
+
+mean_performance_df = mean_performance_df.reset_index(drop=True)
+
+print("\nAverage Mean Performance for Each Hyperparameter Value:")
+print(mean_performance_df)
+
+# Perform ANOVA to assess the significance of each hyperparameter
+anova_df = results_df.copy()
+anova_df['lr'] = anova_df['lr'].astype('category')
+anova_df['wd'] = anova_df['wd'].astype('category')
+anova_df['batch_size'] = anova_df['batch_size'].astype('category')
+anova_df['warm_up'] = anova_df['warm_up'].astype('category')
+
+formula = 'best_f1 ~ C(lr) + C(wd) + C(batch_size) + C(warm_up)'
+
+model = ols(formula, data=anova_df).fit()
+
+# Perform ANOVA
+anova_table = sm.stats.anova_lm(model, typ=2)  # Type II ANOVA DataFrame
+
+anova_table = anova_table.round(4)
+
+print("\nANOVA Results:")
+print(anova_table)
+
+
+
+
+
+
+data_collator = DataCollatorForTokenClassification(tokenizer)
+metric = evaluate.load('seqeval')
+
+model = AutoModelForTokenClassification.from_pretrained(
+    base_model_checkpoint,
+    id2label=id2label,
+    label2id=label2id,
+)
+
+args = TrainingArguments(
+    output_dir=model_name,  
+    evaluation_strategy="epoch",  
+    save_strategy="epoch",  
+    learning_rate=0.00010, 
+    num_train_epochs=3,  
+    weight_decay=0.1,  
+    per_device_train_batch_size=16,  
+    per_device_eval_batch_size=16,  
+    warmup_steps=100,  
+)
+
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=data_tokenized["train"],
+    eval_dataset=data_tokenized["val"],
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+    processing_class=tokenizer,
+)
+
+trainer.train()
+
+test_results = trainer.predict(data_tokenized["test"])
+test_predictions, test_labels, _ = test_results
+
+test_predictions = np.argmax(test_predictions, axis=2)
+
+true_test_predictions = [
+    [id2label[pred] for (pred, lab) in zip(prediction, label) if lab != -100]
+    for prediction, label in zip(test_predictions, test_labels)
+]
+true_test_labels = [
+    [id2label[lab] for (pred, lab) in zip(prediction, label) if lab != -100]
+    for label, prediction in zip(test_labels, test_predictions)
+]
+
+# Compute metrics
+results = metric.compute(predictions=true_test_predictions, references=true_test_labels)
+
+precision = results["overall_precision"]
+recall = results["overall_recall"]
+f1 = results["overall_f1"]
+
+print(f"Precision on Test Set: {precision:.4f}")
+print(f"Recall on Test Set: {recall:.4f}")
+print(f"F1 Score on Test Set: {f1:.4f}")
+
+
+
+
+
+
+from seqeval.metrics import classification_report as seqeval_classification_report
+from sklearn.metrics import classification_report
+
+# Evaluate on the test set
+test_results = trainer.predict(data_tokenized["test"])
+test_predictions, test_labels, _ = test_results
+
+test_predictions = np.argmax(test_predictions, axis=2)
+
+true_test_predictions = [
+    [label_names[pred] for (pred, lab) in zip(prediction, label) if lab != -100]
+    for prediction, label in zip(test_predictions, test_labels)
+]
+true_test_labels = [
+    [label_names[lab] for (lab, pred) in zip(label, prediction) if lab != -100]
+    for label, prediction in zip(test_labels, test_predictions)
+]
+
+
+flat_true_test_labels = [item for sublist in true_test_labels for item in sublist]
+flat_true_test_predictions = [item for sublist in true_test_predictions for item in sublist]
+
+unique_labels = [label for label in label_names if label in set(flat_true_test_labels + flat_true_test_predictions)]
+
+# Generate per-token classification report
+token_report = classification_report(
+    flat_true_test_labels,
+    flat_true_test_predictions,
+    labels=unique_labels,
+    output_dict=True,
+    zero_division=0,
+)
+
+# Per-token metrics
+print("Per-Token Metrics on the Test Set:")
+for label in unique_labels:
+    precision = token_report[label]['precision']
+    recall = token_report[label]['recall']
+    f1_score = token_report[label]['f1-score']
+    support = token_report[label]['support']
+    print(f"Label: {label}")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall:    {recall:.4f}")
+    print(f"  F1-score:  {f1_score:.4f}")
+    print(f"  Support:   {support}\n")
+
+macro_f1_token = token_report['macro avg']['f1-score']
+print(f"Macro-Average F1 Score (Token-Level) on Test Set: {macro_f1_token:.4f}")
+
+entity_report = seqeval_classification_report(
+    true_test_labels,
+    true_test_predictions,
+    output_dict=True,
+    zero_division=0,
+)
+
+# Per Entity metrics
+print("\nEntity-Level Metrics on the Test Set:")
+for entity_type in entity_report:
+    if entity_type in ['macro avg', 'weighted avg']:
+        continue
+    precision = entity_report[entity_type]['precision']
+    recall = entity_report[entity_type]['recall']
+    f1_score = entity_report[entity_type]['f1-score']
+    support = entity_report[entity_type]['support']
+    print(f"Entity Type: {entity_type}")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall:    {recall:.4f}")
+    print(f"  F1-score:  {f1_score:.4f}")
+    print(f"  Support:   {support}\n")
+
+macro_f1_entity = entity_report['macro avg']['f1-score']
+print(f"Macro-Average F1 Score (Entity-Level) on Test Set: {macro_f1_entity:.4f}")
+
+
+
+# Per Prefix metrics
+# Map labels to 'B', 'I', or 'O' by stripping the entity type
+true_test_predictions_bio = [
+    [label.split('-')[0] if label != 'O' else 'O' for label in seq]
+    for seq in true_test_predictions
+]
+true_test_labels_bio = [
+    [label.split('-')[0] if label != 'O' else 'O' for label in seq]
+    for seq in true_test_labels
+]
+
+flat_true_test_labels_bio = [item for sublist in true_test_labels_bio for item in sublist]
+flat_true_test_predictions_bio = [item for sublist in true_test_predictions_bio for item in sublist]
+
+unique_labels_bio = ['B', 'I', 'O']
+
+token_report_bio = classification_report(
+    flat_true_test_labels_bio,
+    flat_true_test_predictions_bio,
+    labels=unique_labels_bio,
+    output_dict=True,
+    zero_division=0,
+)
+
+print("\nPer-Token Metrics on the Test Set (B, I, O labels):")
+for label in unique_labels_bio:
+    precision = token_report_bio[label]['precision']
+    recall = token_report_bio[label]['recall']
+    f1_score = token_report_bio[label]['f1-score']
+    support = token_report_bio[label]['support']
+    print(f"Label: {label}")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall:    {recall:.4f}")
+    print(f"  F1-score:  {f1_score:.4f}")
+    print(f"  Support:   {support}\n")
+
+macro_f1_token_bio = token_report_bio['macro avg']['f1-score']
+print(f"Macro-Average F1 Score (Token-Level, BIO) on Test Set: {macro_f1_token_bio:.4f}")
+
+
+
+
+
+
+%matplotlib inline
+
+token_metrics = {label: metrics for label, metrics in token_report.items()
+                 if label not in ['micro avg', 'macro avg', 'weighted avg', 'accuracy']}
+
+token_df = pd.DataFrame(token_metrics).T.reset_index().rename(columns={'index': 'Label'})
+token_df = token_df[['Label', 'precision', 'recall', 'f1-score', 'support']]
+
+token_melted = token_df.melt(
+    id_vars=['Label', 'support'],
+    value_vars=['precision', 'recall', 'f1-score'],
+    var_name='Metric',
+    value_name='Score'
+)
+
+entity_metrics = {label: metrics for label, metrics in entity_report.items()
+                  if label not in ['micro avg', 'macro avg', 'weighted avg']}
+
+entity_df = pd.DataFrame(entity_metrics).T.reset_index().rename(columns={'index': 'Entity Type'})
+entity_df = entity_df[['Entity Type', 'precision', 'recall', 'f1-score', 'support']]
+
+bio_metrics = {label: metrics for label, metrics in token_report_bio.items() if label in ['B', 'I', 'O']}
+
+bio_df = pd.DataFrame(bio_metrics).T.reset_index().rename(columns={'index': 'Entity Type'})
+bio_df = bio_df[['Entity Type', 'precision', 'recall', 'f1-score', 'support']]
+
+# Combine 'B', 'I', and 'O' metrics with Entity-Level Metrics
+entity_df_combined = pd.concat([entity_df, bio_df], ignore_index=True)
+
+
+entity_melted_combined = entity_df_combined.melt(
+    id_vars=['Entity Type', 'support'],
+    value_vars=['precision', 'recall', 'f1-score'],
+    var_name='Metric',
+    value_name='Score'
+)
+
+# Order 'B', 'I', O'
+
+other_entities = sorted([
+    et for et in entity_df_combined['Entity Type'].unique()
+    if et not in ['B', 'I', 'O']
+])
+desired_order = ['B', 'I', 'O'] + other_entities
+
+entity_melted_combined['Entity Type'] = pd.Categorical(
+    entity_melted_combined['Entity Type'],
+    categories=desired_order,
+    ordered=True
+)
+
+# %%
+# Plot 1: Per-Token Metrics
+plt.figure(figsize=(14, 8))
+sns.barplot(
+    x='Label',
+    y='Score',
+    hue='Metric',
+    data=token_melted,
+    palette='Set2'
+)
+plt.title('Per-Token Precision, Recall, and F1-Score on Test Set')
+plt.ylim(0, 1)
+plt.ylabel('Score')
+plt.xlabel('Token Label')
+plt.legend(title='Metric')
+plt.show()
+
+# %%
+# Plot 2: Entity-Level Metrics including 'B', 'I', and 'O'
+plt.figure(figsize=(14, 8))
+sns.barplot(
+    x='Entity Type',
+    y='Score',
+    hue='Metric',
+    data=entity_melted_combined,
+    palette='Set3'
+)
+plt.title('Entity-Level Precision, Recall, and F1-Score on Test Set (Including \'B\', \'I\', and \'O\' Tokens)')
+plt.ylim(0, 1)
+plt.ylabel('Score')
+plt.xlabel('Entity Type')
+plt.legend(title='Metric')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+
+
+
+
