@@ -1,0 +1,44 @@
+[
+    {
+        "timestamp": "2024-12-30 11:27:01",
+        "model_name": "bert-finetuned-cadec",
+        "model_checkpoint": "bert-base-cased",
+        "training_params": {
+            "learning_rate": 2e-05,
+            "num_epochs": 3,
+            "weight_decay": 0.01
+        },
+        "test_results": {
+            "eval_loss": 0.2646101713180542,
+            "eval_precision": 0.5241895261845386,
+            "eval_recall": 0.6316105769230769,
+            "eval_f1": 0.5729081493594984,
+            "eval_accuracy": 0.91178460771395,
+            "eval_runtime": 2.1412,
+            "eval_samples_per_second": 116.758,
+            "eval_steps_per_second": 14.945,
+            "epoch": 3.0
+        }
+    },
+    {
+        "timestamp": "2024-12-30 11:47:38",
+        "model_name": "bert-finetuned-cadec",
+        "model_checkpoint": "bert-base-cased",
+        "training_params": {
+            "learning_rate": 2e-05,
+            "num_epochs": 10,
+            "weight_decay": 0.01
+        },
+        "test_results": {
+            "eval_loss": 0.3401038348674774,
+            "eval_precision": 0.5646397547266224,
+            "eval_recall": 0.6640625,
+            "eval_f1": 0.6103286384976526,
+            "eval_accuracy": 0.9155240571245414,
+            "eval_runtime": 2.122,
+            "eval_samples_per_second": 117.813,
+            "eval_steps_per_second": 15.08,
+            "epoch": 10.0
+        }
+    }
+]
